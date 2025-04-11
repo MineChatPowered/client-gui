@@ -1,18 +1,17 @@
 use iced::advanced::subscription;
+use iced::alignment::{self, Horizontal};
 use iced::futures;
 use iced::futures::StreamExt;
-use iced::widget::{
-    Button, Column, Container, Row, Scrollable, Text, TextInput, button, scrollable, text_input,
-};
-use iced::{Alignment, Application, Element, Length, Settings, Subscription, Task, executor};
+use iced::widget::{Button, Column, Container, Row, Scrollable, Text, TextInput};
+use iced::{Alignment, Application, Element, Length, Subscription, Task};
 use minechat_protocol::{
-    packets::{self, send_message},
+    packets::send_message,
     protocol::{
         AuthAckPayload, AuthPayload, BroadcastPayload, ChatPayload, DisconnectPayload,
-        MineChatError, MineChatMessage,
+        MineChatMessage,
     },
 };
-use serde::{Deserialize, Serialize};
+use std::hash::Hash;
 use std::net::SocketAddr;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpStream;
@@ -24,13 +23,10 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 enum Message {
-    // Login view messages
     ServerChanged(String),
     LinkCodeChanged(String),
-    Connect, // user pressed Connect button
+    Connect,
     ConnectionResult(Result<ChatConnection, String>),
-
-    // Chat view messages
     InputChanged(String),
     Send,
     Received(MineChatMessage),
@@ -45,40 +41,25 @@ enum Mode {
     Connecting,
     Connected {
         connection: ChatConnection,
-        // messages received (displayed in the chat view)
         messages: Vec<String>,
-        // current user input
         input: String,
     },
 }
 
+#[derive(Debug, Default)]
 struct ChatApp {
-    // UI state for the login view:
     server: String,
     link_code: String,
-    connect_button: button::State,
-    // UI state for the chat view:
-    chat_send_button: button::State,
-    chat_input_state: text_input::State,
-    scroll: scrollable::State,
-    // current mode of the app
     mode: Mode,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct ChatConnection {
-    /// Sender for messages typed by the user
     outgoing: mpsc::UnboundedSender<String>,
-    /// Broadcast channel used for network messages (incoming messages)
     incoming: broadcast::Sender<MineChatMessage>,
 }
 
-// --- Implementation of async connection establishment ---
-// This function uses the underlying protocol to connect, authenticate,
-// and then spawn two background tasks: one to write out messages from the UI
-// and one to read messages from the server.
 async fn connect_async(server: String, link_code: String) -> Result<ChatConnection, String> {
-    // Attempt to parse and connect to the given address.
     let addr: SocketAddr = server
         .parse()
         .map_err(|e| format!("Invalid address: {}", e))?;
@@ -89,22 +70,17 @@ async fn connect_async(server: String, link_code: String) -> Result<ChatConnecti
     let mut reader = BufReader::new(reader);
     let mut writer = writer;
 
-    // For authentication we need to get a client UUID.
-    // (Here, for simplicity, we always generate a new one.)
     let client_uuid = Uuid::new_v4().to_string();
-
-    // Send an AUTH message (using the underlying protocol function)
     let auth_msg = MineChatMessage::Auth {
         payload: AuthPayload {
             client_uuid: client_uuid.clone(),
-            link_code: link_code.clone(), // might be empty
+            link_code,
         },
     };
     send_message(&mut writer, &auth_msg)
         .await
         .map_err(|e| format!("Failed to send auth message: {}", e))?;
 
-    // Wait for the AUTH_ACK
     let mut auth_response = String::new();
     reader
         .read_line(&mut auth_response)
@@ -112,72 +88,45 @@ async fn connect_async(server: String, link_code: String) -> Result<ChatConnecti
         .map_err(|e| format!("Failed to read auth response: {}", e))?;
     let response: MineChatMessage = serde_json::from_str(&auth_response)
         .map_err(|e| format!("Failed to parse auth response: {}", e))?;
-    match response {
-        MineChatMessage::AuthAck { payload } => {
-            if payload.status != "success" {
-                return Err(format!("Auth failed: {}", payload.message));
-            }
-            // Continue with connection
+
+    if let MineChatMessage::AuthAck { payload } = response {
+        if payload.status != "success" {
+            return Err(format!("Auth failed: {}", payload.message));
         }
-        _ => return Err("Unexpected response during authentication".into()),
+    } else {
+        return Err("Unexpected response during authentication".into());
     }
 
-    // Create a channel for outgoing messages (from UI to writer task)
-    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<String>();
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+    let (incoming_tx, _) = broadcast::channel(100);
 
-    // Create a broadcast channel for incoming messages (from reader task to UI subscription)
-    let (incoming_tx, _incoming_rx) = broadcast::channel(100);
-
-    // Spawn a background task to send user messages to the server.
-    // This task will take messages from the `outgoing_rx` channel and send them using the protocol.
     let mut writer_clone = writer;
     tokio::spawn(async move {
         while let Some(line) = outgoing_rx.recv().await {
-            // if the user types a disconnect command, send a disconnect message:
-            if line.trim() == "/quit" || line.trim() == "/exit" {
-                let disconnect_msg = MineChatMessage::Disconnect {
+            let msg = if line.trim() == "/quit" || line.trim() == "/exit" {
+                MineChatMessage::Disconnect {
                     payload: DisconnectPayload {
                         reason: "Client exit".into(),
                     },
-                };
-                let _ = send_message(&mut writer_clone, &disconnect_msg).await;
-                break;
-            } else {
-                // Otherwise, send a chat message:
-                let chat_msg = MineChatMessage::Chat {
-                    payload: ChatPayload { message: line },
-                };
-                if let Err(e) = send_message(&mut writer_clone, &chat_msg).await {
-                    eprintln!("Failed to send chat message: {}", e);
-                    break;
                 }
+            } else {
+                MineChatMessage::Chat {
+                    payload: ChatPayload { message: line },
+                }
+            };
+            if let Err(e) = send_message(&mut writer_clone, &msg).await {
+                eprintln!("Failed to send message: {}", e);
+                break;
             }
         }
     });
 
-    // Spawn a background task to read messages from the server.
-    // For each received message, send it into the broadcast channel.
     let incoming_tx_clone = incoming_tx.clone();
     tokio::spawn(async move {
         let mut reader_lines = reader.lines();
-        loop {
-            match reader_lines.next_line().await {
-                Ok(Some(line)) => match serde_json::from_str::<MineChatMessage>(&line) {
-                    Ok(msg) => {
-                        let _ = incoming_tx_clone.send(msg);
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to parse incoming message: {}", e);
-                    }
-                },
-                Ok(None) => {
-                    // Connection closed
-                    break;
-                }
-                Err(e) => {
-                    eprintln!("Error reading from server: {}", e);
-                    break;
-                }
+        while let Ok(Some(line)) = reader_lines.next_line().await {
+            if let Ok(msg) = serde_json::from_str::<MineChatMessage>(&line) {
+                let _ = incoming_tx_clone.send(msg);
             }
         }
     });
@@ -188,13 +137,10 @@ async fn connect_async(server: String, link_code: String) -> Result<ChatConnecti
     })
 }
 
-// --- Iced Subscription Recipe for Incoming Messages ---
+// --- Subscription Handling ---
 
-#[derive(Debug, Clone)]
 struct ChatReceiver {
-    // A unique ID so that Iced knows whether subscriptions are identical
     id: u32,
-    // The broadcast receiver wrapped as a stream (from tokio_stream)
     stream: BroadcastStream<MineChatMessage>,
 }
 
@@ -204,35 +150,22 @@ impl std::hash::Hash for ChatReceiver {
     }
 }
 
-impl<H, I> subscription::Recipe<H, I> for ChatReceiver
-where
-    H: std::hash::Hasher,
-{
+impl subscription::Recipe for ChatReceiver {
     type Output = Message;
 
-    fn hash(&self, state: &mut H) {
-        // Use the unique id to determine uniqueness.
+    fn hash(&self, state: &mut std::hash::Hasher) {
         self.id.hash(state);
     }
 
-    fn stream(self: Box<Self>, _input: I) -> futures::stream::BoxStream<'static, Self::Output> {
-        // Convert the broadcast stream into a stream of Message::Received.
-        // Note: we ignore errors from BroadcastStream (they occur when lagging behind).
+    fn stream(self: Box<Self>) -> futures::stream::BoxStream<'static, Self::Output> {
         self.stream
-            .filter_map(|result| {
-                futures::future::ready(match result {
-                    Ok(msg) => Some(Message::Received(msg)),
-                    Err(_) => None,
-                })
-            })
+            .filter_map(|result| async move { result.ok().map(|msg| Message::Received(msg)) })
             .boxed()
     }
 }
 
-// --- Implementation of the Iced Application ---
-
 impl ChatApp {
-    pub fn update(&mut self, message: Message) -> Task<Message> {
+    fn update(&mut self, message: Message) -> Task<Message> {
         match &mut self.mode {
             Mode::Disconnected => match message {
                 Message::ServerChanged(val) => {
@@ -244,40 +177,35 @@ impl ChatApp {
                     Task::none()
                 }
                 Message::Connect => {
-                    // When the user presses "Connect", switch to Connecting state and spawn the async task.
                     self.mode = Mode::Connecting;
                     let server = self.server.clone();
                     let link = self.link_code.clone();
-                    return Task::perform(connect_async(server, link), Message::ConnectionResult);
+                    Task::perform(connect_async(server, link), Message::ConnectionResult)
                 }
-                Message::ConnectionResult(Ok(connection)) => {
-                    // Switch to the Connected state.
+                Message::ConnectionResult(Ok(conn)) => {
                     self.mode = Mode::Connected {
-                        connection,
+                        connection: conn,
                         messages: Vec::new(),
                         input: String::new(),
                     };
                     Task::none()
                 }
-                Message::ConnectionResult(Err(err)) => {
-                    // If connection fails, log error and go back to Disconnected.
-                    eprintln!("Connection error: {}", err);
+                Message::ConnectionResult(Err(e)) => {
                     self.mode = Mode::Disconnected;
                     Task::none()
                 }
                 _ => Task::none(),
             },
             Mode::Connecting => match message {
-                Message::ConnectionResult(Ok(connection)) => {
+                Message::ConnectionResult(Ok(conn)) => {
                     self.mode = Mode::Connected {
-                        connection,
+                        connection: conn,
                         messages: Vec::new(),
                         input: String::new(),
                     };
                     Task::none()
                 }
-                Message::ConnectionResult(Err(err)) => {
-                    eprintln!("Connection error: {}", err);
+                Message::ConnectionResult(Err(e)) => {
                     self.mode = Mode::Disconnected;
                     Task::none()
                 }
@@ -293,40 +221,27 @@ impl ChatApp {
                     Task::none()
                 }
                 Message::Send => {
-                    // Send the input text to the server.
                     let msg = input.trim().to_string();
                     if !msg.is_empty() {
-                        if let Err(e) = connection.outgoing.send(msg) {
-                            eprintln!("Failed to send message: {}", e);
-                        }
+                        let _ = connection.outgoing.send(msg);
                     }
                     *input = String::new();
                     Task::none()
                 }
                 Message::Received(msg) => {
-                    // Process the incoming message from the server.
                     match msg {
                         MineChatMessage::Broadcast { payload } => {
                             messages.push(format!("{}: {}", payload.from, payload.message));
                         }
                         MineChatMessage::Chat { payload } => {
-                            messages.push(format!("(you) {}", payload.message));
+                            messages.push(format!("You: {}", payload.message));
                         }
                         MineChatMessage::Disconnect { payload } => {
                             messages.push(format!("Disconnected: {}", payload.reason));
-                            // Move back to Disconnected mode if server disconnects.
                             self.mode = Mode::Disconnected;
                         }
-                        _ => {
-                            // For other message types, just log them.
-                            messages.push(format!("Received: {:?}", msg));
-                        }
+                        _ => (),
                     }
-                    Task::none()
-                }
-                Message::Disconnected(reason) => {
-                    messages.push(format!("Disconnected: {}", reason));
-                    self.mode = Mode::Disconnected;
                     Task::none()
                 }
                 _ => Task::none(),
@@ -334,32 +249,22 @@ impl ChatApp {
         }
     }
 
-    fn view(&mut self) -> Element<Self::Message> {
-        match &mut self.mode {
+    fn view(&self) -> Element<Message> {
+        match &self.mode {
             Mode::Disconnected | Mode::Connecting => {
-                // Show login form.
                 let title = Text::new("Connect to MineChat Server")
-                    .size(40)
-                    .horizontal_alignment(iced::HorizontalAlignment::Center);
-                let server_input = TextInput::new(
-                    &mut self.chat_input_state, // reusing state for simplicity
-                    "Server address (e.g. 127.0.0.1:25575)",
-                    &self.server,
-                    Message::ServerChanged,
-                )
-                .padding(10)
-                .size(20);
+                    .size(30)
+                    .horizontal_alignment(alignment::Horizontal::Center);
 
-                let link_input = TextInput::new(
-                    &mut self.chat_input_state, // reusing same state; in a refined app use separate states
-                    "Link code (optional)",
-                    &self.link_code,
-                    Message::LinkCodeChanged,
-                )
-                .padding(10)
-                .size(20);
+                let server_input = TextInput::new("Server address", &self.server)
+                    .on_input(Message::ServerChanged)
+                    .padding(10);
 
-                let connect_button = Button::new(&mut self.connect_button, Text::new("Connect"))
+                let link_input = TextInput::new("Link code", &self.link_code)
+                    .on_input(Message::LinkCodeChanged)
+                    .padding(10);
+
+                let connect_button = Button::new(Text::new("Connect"))
                     .on_press(Message::Connect)
                     .padding(10);
 
@@ -371,42 +276,42 @@ impl ChatApp {
                     .push(server_input)
                     .push(link_input)
                     .push(connect_button);
+
                 Container::new(content)
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .center_y()
                     .center_x()
+                    .center_y()
                     .into()
             }
             Mode::Connected {
-                messages, input, ..
+                messages,
+                input,
+                connection: _,
             } => {
-                // Show chat view.
-                let messages: Element<_> = messages
-                    .iter()
-                    .fold(Column::new().spacing(5), |column, message| {
-                        column.push(Text::new(message).size(16))
-                    })
+                let messages: Element<_> =
+                    Scrollable::new(messages.iter().fold(Column::new().spacing(5), |col, msg| {
+                        col.push(Text::new(msg))
+                    }))
+                    .width(Length::Fill)
+                    .height(Length::FillPortion(5))
                     .into();
 
-                let chat_input = TextInput::new(
-                    &mut self.chat_input_state,
-                    "Type a message",
-                    input,
-                    Message::InputChanged,
-                )
-                .padding(10)
-                .size(20);
+                let chat_input = TextInput::new("Type a message", input)
+                    .on_input(Message::InputChanged)
+                    .padding(10)
+                    .width(Length::FillPortion(5));
 
-                let send_button = Button::new(&mut self.chat_send_button, Text::new("Send"))
-                    .on_press(Message::Send);
+                let send_button = Button::new(Text::new("Send"))
+                    .on_press(Message::Send)
+                    .padding(10);
 
                 let input_row = Row::new().spacing(10).push(chat_input).push(send_button);
 
                 let content = Column::new()
-                    .padding(20)
+                    .padding(10)
                     .spacing(10)
-                    .push(Scrollable::new(&mut self.scroll).push(messages))
+                    .push(messages)
                     .push(input_row);
 
                 Container::new(content)
@@ -417,16 +322,11 @@ impl ChatApp {
         }
     }
 
-    // Use a subscription to listen for incoming messages from the network connection.
-    fn subscription(&self) -> Subscription<Self::Message> {
+    fn subscription(&self) -> Subscription<Message> {
         match &self.mode {
-            // Only subscribe if connected.
             Mode::Connected { connection, .. } => {
-                // Create a fresh receiver from the broadcast channel.
                 let rx = connection.incoming.subscribe();
-                // Wrap it as a tokio_stream::wrappers::BroadcastStream.
                 let stream = BroadcastStream::new(rx);
-                // Use our custom subscription recipe.
                 Subscription::from_recipe(ChatReceiver { id: 42, stream })
             }
             _ => Subscription::none(),
@@ -434,12 +334,6 @@ impl ChatApp {
     }
 }
 
-#[tokio::main]
-async fn main() -> iced::Result {
-    // Initialize logger if desired
-    env_logger::init();
-
-    iced::application("MineChat", ChatApp::update, ChatApp::view)
-        .theme(|theme| iced::Theme::Dark)
-        .run()
+fn main() -> iced::Result {
+    iced::run("", ChatApp::update, ChatApp::view)
 }
