@@ -1,9 +1,10 @@
+use iced::advanced::subscription;
 use iced::futures;
 use iced::futures::StreamExt;
-use iced::{
-    Alignment, Application, Button, Column, Command, Container, Element, Length, Row, Scrollable,
-    Settings, Subscription, Text, TextInput, button, executor, scrollable, text_input,
+use iced::widget::{
+    Button, Column, Container, Row, Scrollable, Text, TextInput, button, scrollable, text_input,
 };
+use iced::{Alignment, Application, Element, Length, Settings, Subscription, Task, executor};
 use minechat_protocol::{
     packets::{self, send_message},
     protocol::{
@@ -22,7 +23,7 @@ use uuid::Uuid;
 // --- Application Messages ---
 
 #[derive(Debug, Clone)]
-enum AppMessage {
+enum Message {
     // Login view messages
     ServerChanged(String),
     LinkCodeChanged(String),
@@ -63,22 +64,6 @@ struct ChatApp {
     // current mode of the app
     mode: Mode,
 }
-
-impl Default for ChatApp {
-    fn default() -> Self {
-        Self {
-            server: String::new(),
-            link_code: String::new(),
-            connect_button: button::State::new(),
-            chat_send_button: button::State::new(),
-            chat_input_state: text_input::State::new(),
-            scroll: scrollable::State::new(),
-            mode: Mode::Disconnected,
-        }
-    }
-}
-
-// --- ChatConnection: holds channels for outgoing and incoming messages ---
 
 #[derive(Clone)]
 struct ChatConnection {
@@ -219,11 +204,11 @@ impl std::hash::Hash for ChatReceiver {
     }
 }
 
-impl<H, I> iced_native::subscription::Recipe<H, I> for ChatReceiver
+impl<H, I> subscription::Recipe<H, I> for ChatReceiver
 where
     H: std::hash::Hasher,
 {
-    type Output = AppMessage;
+    type Output = Message;
 
     fn hash(&self, state: &mut H) {
         // Use the unique id to determine uniqueness.
@@ -231,12 +216,12 @@ where
     }
 
     fn stream(self: Box<Self>, _input: I) -> futures::stream::BoxStream<'static, Self::Output> {
-        // Convert the broadcast stream into a stream of AppMessage::Received.
+        // Convert the broadcast stream into a stream of Message::Received.
         // Note: we ignore errors from BroadcastStream (they occur when lagging behind).
         self.stream
             .filter_map(|result| {
                 futures::future::ready(match result {
-                    Ok(msg) => Some(AppMessage::Received(msg)),
+                    Ok(msg) => Some(Message::Received(msg)),
                     Err(_) => None,
                 })
             })
@@ -246,83 +231,68 @@ where
 
 // --- Implementation of the Iced Application ---
 
-impl Application for ChatApp {
-    type Executor = executor::Tokio;
-    type Message = AppMessage;
-    type Flags = ();
-
-    fn new(_flags: ()) -> (Self, Command<Self::Message>) {
-        (ChatApp::default(), Command::none())
-    }
-
-    fn title(&self) -> String {
-        String::from("MineChat (Iced GUI)")
-    }
-
-    fn update(&mut self, message: Self::Message) -> Command<Self::Message> {
+impl ChatApp {
+    pub fn update(&mut self, message: Message) -> Task<Message> {
         match &mut self.mode {
             Mode::Disconnected => match message {
-                AppMessage::ServerChanged(val) => {
+                Message::ServerChanged(val) => {
                     self.server = val;
-                    Command::none()
+                    Task::none()
                 }
-                AppMessage::LinkCodeChanged(val) => {
+                Message::LinkCodeChanged(val) => {
                     self.link_code = val;
-                    Command::none()
+                    Task::none()
                 }
-                AppMessage::Connect => {
+                Message::Connect => {
                     // When the user presses "Connect", switch to Connecting state and spawn the async task.
                     self.mode = Mode::Connecting;
                     let server = self.server.clone();
                     let link = self.link_code.clone();
-                    return Command::perform(
-                        connect_async(server, link),
-                        AppMessage::ConnectionResult,
-                    );
+                    return Task::perform(connect_async(server, link), Message::ConnectionResult);
                 }
-                AppMessage::ConnectionResult(Ok(connection)) => {
+                Message::ConnectionResult(Ok(connection)) => {
                     // Switch to the Connected state.
                     self.mode = Mode::Connected {
                         connection,
                         messages: Vec::new(),
                         input: String::new(),
                     };
-                    Command::none()
+                    Task::none()
                 }
-                AppMessage::ConnectionResult(Err(err)) => {
+                Message::ConnectionResult(Err(err)) => {
                     // If connection fails, log error and go back to Disconnected.
                     eprintln!("Connection error: {}", err);
                     self.mode = Mode::Disconnected;
-                    Command::none()
+                    Task::none()
                 }
-                _ => Command::none(),
+                _ => Task::none(),
             },
             Mode::Connecting => match message {
-                AppMessage::ConnectionResult(Ok(connection)) => {
+                Message::ConnectionResult(Ok(connection)) => {
                     self.mode = Mode::Connected {
                         connection,
                         messages: Vec::new(),
                         input: String::new(),
                     };
-                    Command::none()
+                    Task::none()
                 }
-                AppMessage::ConnectionResult(Err(err)) => {
+                Message::ConnectionResult(Err(err)) => {
                     eprintln!("Connection error: {}", err);
                     self.mode = Mode::Disconnected;
-                    Command::none()
+                    Task::none()
                 }
-                _ => Command::none(),
+                _ => Task::none(),
             },
             Mode::Connected {
                 connection,
                 messages,
                 input,
             } => match message {
-                AppMessage::InputChanged(val) => {
+                Message::InputChanged(val) => {
                     *input = val;
-                    Command::none()
+                    Task::none()
                 }
-                AppMessage::Send => {
+                Message::Send => {
                     // Send the input text to the server.
                     let msg = input.trim().to_string();
                     if !msg.is_empty() {
@@ -331,9 +301,9 @@ impl Application for ChatApp {
                         }
                     }
                     *input = String::new();
-                    Command::none()
+                    Task::none()
                 }
-                AppMessage::Received(msg) => {
+                Message::Received(msg) => {
                     // Process the incoming message from the server.
                     match msg {
                         MineChatMessage::Broadcast { payload } => {
@@ -352,14 +322,14 @@ impl Application for ChatApp {
                             messages.push(format!("Received: {:?}", msg));
                         }
                     }
-                    Command::none()
+                    Task::none()
                 }
-                AppMessage::Disconnected(reason) => {
+                Message::Disconnected(reason) => {
                     messages.push(format!("Disconnected: {}", reason));
                     self.mode = Mode::Disconnected;
-                    Command::none()
+                    Task::none()
                 }
-                _ => Command::none(),
+                _ => Task::none(),
             },
         }
     }
@@ -375,7 +345,7 @@ impl Application for ChatApp {
                     &mut self.chat_input_state, // reusing state for simplicity
                     "Server address (e.g. 127.0.0.1:25575)",
                     &self.server,
-                    AppMessage::ServerChanged,
+                    Message::ServerChanged,
                 )
                 .padding(10)
                 .size(20);
@@ -384,13 +354,13 @@ impl Application for ChatApp {
                     &mut self.chat_input_state, // reusing same state; in a refined app use separate states
                     "Link code (optional)",
                     &self.link_code,
-                    AppMessage::LinkCodeChanged,
+                    Message::LinkCodeChanged,
                 )
                 .padding(10)
                 .size(20);
 
                 let connect_button = Button::new(&mut self.connect_button, Text::new("Connect"))
-                    .on_press(AppMessage::Connect)
+                    .on_press(Message::Connect)
                     .padding(10);
 
                 let content = Column::new()
@@ -423,13 +393,13 @@ impl Application for ChatApp {
                     &mut self.chat_input_state,
                     "Type a message",
                     input,
-                    AppMessage::InputChanged,
+                    Message::InputChanged,
                 )
                 .padding(10)
                 .size(20);
 
                 let send_button = Button::new(&mut self.chat_send_button, Text::new("Send"))
-                    .on_press(AppMessage::Send);
+                    .on_press(Message::Send);
 
                 let input_row = Row::new().spacing(10).push(chat_input).push(send_button);
 
@@ -465,9 +435,11 @@ impl Application for ChatApp {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> iced::Result {
     // Initialize logger if desired
     env_logger::init();
 
-    ChatApp::run(Settings::default()).await.unwrap();
+    iced::application("MineChat", ChatApp::update, ChatApp::view)
+        .theme(|theme| iced::Theme::Dark)
+        .run()
 }
