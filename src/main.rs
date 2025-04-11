@@ -1,9 +1,10 @@
-use iced::advanced::subscription;
-use iced::alignment::{self, Horizontal};
-use iced::futures;
-use iced::futures::StreamExt;
-use iced::widget::{Button, Column, Container, Row, Scrollable, Text, TextInput};
-use iced::{Alignment, Application, Element, Length, Subscription, Task};
+use iced::{
+    Alignment, Element, Length, Subscription, Task,
+    advanced::subscription,
+    alignment::{self, Horizontal},
+    futures::{self, StreamExt},
+    widget::{Button, Column, Container, Row, Scrollable, Text, TextInput},
+};
 use minechat_protocol::{
     packets::send_message,
     protocol::{
@@ -11,15 +12,14 @@ use minechat_protocol::{
         MineChatMessage,
     },
 };
-use std::hash::Hash;
-use std::net::SocketAddr;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc};
+use std::{hash::Hash, net::SocketAddr};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    net::TcpStream,
+    sync::{broadcast, mpsc},
+};
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
-
-// --- Application Messages ---
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -32,8 +32,6 @@ enum Message {
     Received(MineChatMessage),
     Disconnected(String),
 }
-
-// --- Application State ---
 
 #[derive(Debug)]
 enum Mode {
