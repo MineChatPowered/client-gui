@@ -1,9 +1,9 @@
 use iced::{
-    Alignment, Element, Length, Subscription, Task,
+    Element, Length, Subscription, Task,
     advanced::subscription,
-    alignment::{self, Horizontal},
-    futures::{self, StreamExt},
-    widget::{Button, Column, Container, Row, Scrollable, Text, TextInput},
+    alignment::{Horizontal, Vertical},
+    futures::{self, Stream, StreamExt},
+    widget::{Container, Scrollable, button, column, row, text, text_input},
 };
 use minechat_protocol::{
     packets::send_message,
@@ -12,7 +12,7 @@ use minechat_protocol::{
         MineChatMessage,
     },
 };
-use std::{hash::Hash, net::SocketAddr};
+use std::{hash::Hash, net::SocketAddr, pin::Pin, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::TcpStream,
@@ -29,7 +29,7 @@ enum Message {
     ConnectionResult(Result<ChatConnection, String>),
     InputChanged(String),
     Send,
-    Received(MineChatMessage),
+    Received(Arc<MineChatMessage>),
     Disconnected(String),
 }
 
@@ -44,6 +44,12 @@ enum Mode {
     },
 }
 
+impl Default for Mode {
+    fn default() -> Self {
+        Mode::Disconnected
+    }
+}
+
 #[derive(Debug, Default)]
 struct ChatApp {
     server: String,
@@ -54,7 +60,7 @@ struct ChatApp {
 #[derive(Debug, Clone)]
 struct ChatConnection {
     outgoing: mpsc::UnboundedSender<String>,
-    incoming: broadcast::Sender<MineChatMessage>,
+    incoming: broadcast::Sender<Arc<MineChatMessage>>,
 }
 
 async fn connect_async(server: String, link_code: String) -> Result<ChatConnection, String> {
@@ -95,8 +101,8 @@ async fn connect_async(server: String, link_code: String) -> Result<ChatConnecti
         return Err("Unexpected response during authentication".into());
     }
 
-    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
-    let (incoming_tx, _) = broadcast::channel(100);
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<String>();
+    let (incoming_tx, _) = broadcast::channel::<Arc<MineChatMessage>>(100);
 
     let mut writer_clone = writer;
     tokio::spawn(async move {
@@ -124,7 +130,7 @@ async fn connect_async(server: String, link_code: String) -> Result<ChatConnecti
         let mut reader_lines = reader.lines();
         while let Ok(Some(line)) = reader_lines.next_line().await {
             if let Ok(msg) = serde_json::from_str::<MineChatMessage>(&line) {
-                let _ = incoming_tx_clone.send(msg);
+                let _ = incoming_tx_clone.send(Arc::new(msg));
             }
         }
     });
@@ -135,11 +141,9 @@ async fn connect_async(server: String, link_code: String) -> Result<ChatConnecti
     })
 }
 
-// --- Subscription Handling ---
-
 struct ChatReceiver {
     id: u32,
-    stream: BroadcastStream<MineChatMessage>,
+    stream: BroadcastStream<Arc<MineChatMessage>>,
 }
 
 impl std::hash::Hash for ChatReceiver {
@@ -151,11 +155,14 @@ impl std::hash::Hash for ChatReceiver {
 impl subscription::Recipe for ChatReceiver {
     type Output = Message;
 
-    fn hash(&self, state: &mut std::hash::Hasher) {
+    fn hash(&self, state: &mut iced::advanced::subscription::Hasher) {
         self.id.hash(state);
     }
 
-    fn stream(self: Box<Self>) -> futures::stream::BoxStream<'static, Self::Output> {
+    fn stream(
+        self: Box<Self>,
+        _input: Pin<Box<dyn Stream<Item = subscription::Event> + Send>>,
+    ) -> futures::stream::BoxStream<'static, Self::Output> {
         self.stream
             .filter_map(|result| async move { result.ok().map(|msg| Message::Received(msg)) })
             .boxed()
@@ -227,7 +234,7 @@ impl ChatApp {
                     Task::none()
                 }
                 Message::Received(msg) => {
-                    match msg {
+                    match &*msg {
                         MineChatMessage::Broadcast { payload } => {
                             messages.push(format!("{}: {}", payload.from, payload.message));
                         }
@@ -250,36 +257,32 @@ impl ChatApp {
     fn view(&self) -> Element<Message> {
         match &self.mode {
             Mode::Disconnected | Mode::Connecting => {
-                let title = Text::new("Connect to MineChat Server")
+                let title = text("Connect to MineChat Server")
                     .size(30)
-                    .horizontal_alignment(alignment::Horizontal::Center);
+                    .align_x(Horizontal::Center)
+                    .align_y(Vertical::Center);
 
-                let server_input = TextInput::new("Server address", &self.server)
+                let server_input = text_input("Server address", &self.server)
                     .on_input(Message::ServerChanged)
                     .padding(10);
 
-                let link_input = TextInput::new("Link code", &self.link_code)
+                let link_input = text_input("Link code", &self.link_code)
                     .on_input(Message::LinkCodeChanged)
                     .padding(10);
 
-                let connect_button = Button::new(Text::new("Connect"))
+                let connect_button = button(text("Connect"))
                     .on_press(Message::Connect)
                     .padding(10);
 
-                let content = Column::new()
+                let content = column![title, server_input, link_input, connect_button]
                     .padding(20)
                     .spacing(20)
-                    .align_items(Alignment::Center)
-                    .push(title)
-                    .push(server_input)
-                    .push(link_input)
-                    .push(connect_button);
+                    .align_x(Horizontal::Center);
 
                 Container::new(content)
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .center_x()
-                    .center_y()
+                    .center(Length::Fill)
                     .into()
             }
             Mode::Connected {
@@ -287,30 +290,25 @@ impl ChatApp {
                 input,
                 connection: _,
             } => {
-                let messages: Element<_> =
-                    Scrollable::new(messages.iter().fold(Column::new().spacing(5), |col, msg| {
-                        col.push(Text::new(msg))
-                    }))
-                    .width(Length::Fill)
-                    .height(Length::FillPortion(5))
-                    .into();
+                let messages: Element<_> = Scrollable::new(
+                    messages
+                        .iter()
+                        .fold(column![].spacing(5), |col, msg| col.push(text(msg))),
+                )
+                .width(Length::Fill)
+                .height(Length::FillPortion(5))
+                .into();
 
-                let chat_input = TextInput::new("Type a message", input)
+                let chat_input = text_input("Type a message", input)
                     .on_input(Message::InputChanged)
                     .padding(10)
                     .width(Length::FillPortion(5));
 
-                let send_button = Button::new(Text::new("Send"))
-                    .on_press(Message::Send)
-                    .padding(10);
+                let send_button = button(text("Send")).on_press(Message::Send).padding(10);
 
-                let input_row = Row::new().spacing(10).push(chat_input).push(send_button);
+                let input_row = row![chat_input, send_button].spacing(10);
 
-                let content = Column::new()
-                    .padding(10)
-                    .spacing(10)
-                    .push(messages)
-                    .push(input_row);
+                let content = column![messages, input_row].padding(10).spacing(10);
 
                 Container::new(content)
                     .width(Length::Fill)
@@ -325,7 +323,7 @@ impl ChatApp {
             Mode::Connected { connection, .. } => {
                 let rx = connection.incoming.subscribe();
                 let stream = BroadcastStream::new(rx);
-                Subscription::from_recipe(ChatReceiver { id: 42, stream })
+                subscription::from_recipe(ChatReceiver { id: 42, stream })
             }
             _ => Subscription::none(),
         }
@@ -333,5 +331,10 @@ impl ChatApp {
 }
 
 fn main() -> iced::Result {
-    iced::run("", ChatApp::update, ChatApp::view)
+    env_logger::init();
+    let theme = |_s: &ChatApp| iced::Theme::Dark;
+    iced::application("MineChat GUI", ChatApp::update, ChatApp::view)
+        .theme(theme)
+        .centered()
+        .run()
 }
