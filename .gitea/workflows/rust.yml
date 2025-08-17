@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+
+jobs:
+  ci-build:
+    name: CI build
+    runs-on: codeberg-small
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: msrd0/rust-toolchain@stable
+
+      - name: Build binary
+        run: cargo build
