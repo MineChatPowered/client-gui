@@ -20,25 +20,6 @@ use uuid::Uuid;
 
 use kyori_component_json::Component;
 
-fn component_to_plain_text(component: &Component) -> String {
-    match component {
-        Component::String(s) => s.clone(),
-        Component::Array(components) => components.iter().map(component_to_plain_text).collect(),
-        Component::Object(obj) => {
-            let mut text = String::new();
-            if let Some(s) = &obj.text {
-                text.push_str(s);
-            }
-            if let Some(extra) = &obj.extra {
-                for component in extra {
-                    text.push_str(&component_to_plain_text(component));
-                }
-            }
-            text
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 enum Message {
     ServerChanged(String),
@@ -155,7 +136,7 @@ impl iced_futures::subscription::Recipe for ChatSubscriptionRecipe {
         self: Box<Self>,
         _input: EventStream, // Changed to EventStream
     ) -> iced_futures::BoxStream<Self::Output> {
-        let tokio_receiver = self.receiver; // tokio_receiver is immutable
+        let tokio_receiver = self.receiver;
 
         let (mut sender, receiver_iced) = iced::futures::channel::mpsc::unbounded(); // receiver_iced is immutable
 
@@ -224,9 +205,7 @@ impl ChatApp {
                 messages,
                 input,
             } => match message {
-                Message::InputChanged(i) => {
-                    *input = i;
-                }
+                Message::InputChanged(i) => *input = i,
                 Message::Send => {
                     let msg = input.trim().to_string();
                     if !msg.is_empty() {
@@ -244,7 +223,7 @@ impl ChatApp {
                 }
                 Message::Received(msg) => match &*msg {
                     MineChatMessage::Broadcast { payload } => {
-                        let text = component_to_plain_text(&payload.message);
+                        let text = &payload.message.to_plain_text();
                         messages.push(format!("[{}] {}", payload.from, text));
                     }
                     MineChatMessage::Disconnect { payload } => {
@@ -254,6 +233,7 @@ impl ChatApp {
                             link_code: "".to_string(),
                         });
                     }
+                    // We don't care about the other MineChat messages, so we skip them
                     _ => {}
                 },
                 _ => {}
