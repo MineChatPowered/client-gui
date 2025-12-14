@@ -3,19 +3,22 @@ name: CI
 on:
   push:
     branches:
-      - '**'
+      - 'main'
 
 jobs:
   ci-build:
     name: CI build
-    runs-on: codeberg-small
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust (stable)
-        uses: msrd0/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build binary
         run: cargo build
+
+      - name: Run Unit Tests
+        run: cargo test
