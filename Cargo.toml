@@ -6,12 +6,13 @@ edition = "2024"
 [dependencies]
 env_logger = "0.11.8"
 # futures = "0.3.31"
-iced = { version = "0.13.1", features = ["tokio"] }
+iced = { version = "0.14.0", features = ["tokio"] }
+iced_futures = "0.14.0"
 iced_aw = "0.12.2"
 log = "0.4.27"
 miette = { version = "7.5.0", features = ["fancy"] }
-minechat-protocol = { git = "https://github.com/MineChatPowered/protocol-rs.git" }
-kyori-component-json = { git = "https://github.com/walker84837/kyori-component-json.git" }
+minechat-protocol = { git = "https://github.com/MineChatPowered/protocol-rs.git", features = ["tokio"] }
+kyori-component-json = "0.2.1"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 tokio = { version = "1.44.2", features = ["full"] }

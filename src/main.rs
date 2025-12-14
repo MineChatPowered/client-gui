@@ -1,18 +1,21 @@
 use iced::{
     Element, Subscription, Task,
+    futures::SinkExt as _,
     widget::{Column, Scrollable, button, column, row, text, text_input},
 };
+use iced_futures::subscription::EventStream;
 use log::error;
 use minechat_protocol::{
     MessageStream, TokioMessageStream,
     protocol::{AuthPayload, ChatPayload, MineChatMessage},
 };
+use std::hash::Hash;
 use std::sync::Arc;
 use tokio::{
     net::TcpStream,
     sync::{broadcast, mpsc},
 };
-use tokio_stream::{StreamExt, wrappers::BroadcastStream};
+use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
 use kyori_component_json::Component;
@@ -100,7 +103,7 @@ async fn connect(server: String, link_code: String) -> Result<ChatConnection, St
         .await
         .map_err(|e| e.to_string())?;
 
-    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+    let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::unbounded_channel();
     let (incoming_tx, _) = broadcast::channel(100);
     let incoming_tx_clone = incoming_tx.clone();
 
@@ -134,6 +137,48 @@ async fn connect(server: String, link_code: String) -> Result<ChatConnection, St
         outgoing: outgoing_tx,
         incoming: incoming_tx,
     })
+}
+
+// Custom Recipe struct to hold the broadcast receiver
+struct ChatSubscriptionRecipe {
+    receiver: tokio::sync::broadcast::Receiver<Arc<MineChatMessage>>,
+}
+
+impl iced_futures::subscription::Recipe for ChatSubscriptionRecipe {
+    type Output = Message;
+
+    fn hash(&self, state: &mut iced_futures::subscription::Hasher) {
+        "chat_subscription".hash(state);
+    }
+
+    fn stream(
+        self: Box<Self>,
+        _input: EventStream, // Changed to EventStream
+    ) -> iced_futures::BoxStream<Self::Output> {
+        let tokio_receiver = self.receiver; // tokio_receiver is immutable
+
+        let (mut sender, receiver_iced) = iced::futures::channel::mpsc::unbounded(); // receiver_iced is immutable
+
+        tokio::spawn(async move {
+            let mut broadcast_stream = BroadcastStream::new(tokio_receiver);
+            while let Some(msg) = tokio_stream::StreamExt::next(&mut broadcast_stream).await {
+                if let Ok(msg) = msg
+                    && sender.send(Message::Received(msg)).await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        iced_futures::boxed_stream(iced::futures::stream::unfold(
+            receiver_iced,
+            |mut receiver_iced| async move {
+                iced::futures::StreamExt::next(&mut receiver_iced)
+                    .await
+                    .map(|msg| (msg, receiver_iced))
+            },
+        ))
+    }
 }
 
 impl ChatApp {
@@ -226,12 +271,7 @@ impl ChatApp {
         match &self.state {
             State::Connected { connection, .. } => {
                 let receiver = connection.incoming.subscribe();
-                Subscription::run_with_id(
-                    "messages",
-                    BroadcastStream::new(receiver)
-                        .map(|result| result.unwrap())
-                        .map(Message::Received),
-                )
+                iced_futures::subscription::from_recipe(ChatSubscriptionRecipe { receiver })
             }
             _ => Subscription::none(),
         }
@@ -280,9 +320,8 @@ impl ChatApp {
 
 fn main() -> iced::Result {
     env_logger::init();
-    iced::application("MineChat GUI", ChatApp::update, ChatApp::view)
+    iced::application(ChatApp::default, ChatApp::update, ChatApp::view)
+        .title("MineChat GUI")
         .subscription(ChatApp::subscription)
-        .run_with(|| (ChatApp::default(), Task::none()))
+        .run()
 }
-
-
